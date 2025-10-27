@@ -7,12 +7,83 @@ from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import os
+import redis.asyncio as redis
 from functools import lru_cache
 from dotenv import load_dotenv
+import hashlib
 
 load_dotenv()
 
+REDIS_URL = os.getenv("REDIS_CACHE_URL")
+CACHE_TTL = int(os.getenv("CACHE_TTL", "600"))
+redis_client = None
+
+async def get_redis_client():
+    global redis_client
+    if redis_client is None:
+        try:
+            redis_client = redis.from_url(
+                REDIS_URL,
+                decode_responses=True
+            )
+            await redis_client.ping()
+            print("Redis connected successfully via Upstash TCP")
+        except Exception as e:
+            print(f"Redis connection failed: {e}")
+            print("App will run without caching")
+            redis_client = None
+
+    return redis_client
+        
+
+
 app = FastAPI(title="AI Career Roadmap Generator", version="2.0.0")
+
+@app.on_event("startup")
+async def startup_event():
+    await get_redis_client()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global redis_client
+    if redis_client:
+        await redis_client.close()
+
+def generate_cache_key(target_role: str, experience_level: str, total_time: str) -> str:
+    target_role = target_role.lower().strip()
+    experience_level = experience_level.lower().strip()
+    total_time = total_time.lower().strip()
+    combined = f"{target_role}:{experience_level}:{total_time}"
+
+    return f"roadmap_cache:{hashlib.sha256(combined.encode()).hexdigest()}"
+
+async def save_to_cache(cache_key: str, data: Dict[str, Any]):
+    try:
+        r = await redis_client
+        if not r:
+            return
+        await r.setex(
+            cache_key,
+            CACHE_TTL,
+            json.dumps(data)
+        )
+        print(f"Saved to cache with key: {cache_key}")
+    except Exception as e:
+        print(f"Error saving to cache: {e}")
+
+async def get_from_cache(cache_key: str):
+    try:
+        r = await redis_client
+        if not r:
+            return None
+        cache_data = await r.get(cache_key)
+        if cache_data:
+            print("cache hit")
+            return json.loads(cache_data)
+    except Exception as e:
+        print(f"Cache read error: {e}")
+    return None
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -481,6 +552,13 @@ async def generate_roadmap(
     generator: FlexibleRoadmapGenerator = Depends(get_roadmap_generator)
 ):
     try:
+        cache_key = generate_cache_key(request.target_role, request.experience_level, request.total_time)
+        
+        cache_result = await get_from_cache(cache_key)
+        if cache_result:
+            print(f"Returning cached roadmap for: {request.target_role}")
+            return RoadmapResponse(**cache_result)
+
         user_input = {
             "target_role": request.target_role,
             "experience_level": request.experience_level,
@@ -488,6 +566,7 @@ async def generate_roadmap(
         }
         
         result = await generator.generate_complete_roadmap(user_input)
+        await save_to_cache(cache_key, result)
         return RoadmapResponse(**result)
         
     except Exception as e:
@@ -495,7 +574,26 @@ async def generate_roadmap(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "model": "llama-3.3-70b-versatile"}
+    return {"status": "healthy", "model": "openai/gpt-oss-20b"}
+
+@app.delete("/cache/clear")
+async def clear_cache():
+    """Clear all roadmap cache entries"""
+    try:
+        r = await get_redis_client()
+        if not r:
+            return {"error": "Cache not available"}
+        
+        keys = await r.keys("roadmap:*")
+        if keys:
+            await r.delete(*keys)
+        
+        return {
+            "success": True,
+            "message": f"Cleared {len(keys)} cached roadmaps"
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
